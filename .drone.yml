@@ -11,7 +11,7 @@ steps:
       - name: dockersock
         path: /var/run/
     commands:
-      - docker build -f cmd/fluent-bit/Dockerfile --tag dijitle/fluent-bit-plugin-loki:$DRONE_COMMIT cmd/fluent-bit
+      - docker build -f cmd/fluent-bit/Dockerfile --tag dijitle/fluent-bit-plugin-loki:$DRONE_COMMIT .
   - name: push
     image: docker:dind
     privileged: true
@@ -36,6 +36,6 @@ volumes:
       path: /var/run/
 ---
 kind: signature
-hmac: cfedfad589074ed17e9644192c483583367f5ffd2fb2ce8aac16c44d84af0608
+hmac: de0f0b46d23c26baf882ea0ecf8c1b4117a2e3027a06df7896b2afd289758f82
 
 ...
