@@ -1,0 +1,41 @@
+---
+kind: pipeline
+type: kubernetes
+name: default
+
+steps:
+  - name: build
+    image: docker:dind
+    privileged: true
+    volumes:
+      - name: dockersock
+        path: /var/run/
+    commands:
+      - docker build -f cmd/fluent-bit/Dockerfile --tag dijitle/fluent-bit-plugin-loki:$DRONE_COMMIT cmd/fluent-bit
+  - name: push
+    image: docker:dind
+    privileged: true
+    environment:
+      USERNAME:
+        from_secret: docker_username
+      PASSWORD:
+        from_secret: docker_password
+    volumes:
+      - name: dockersock
+        path: /var/run/
+    commands:
+      - docker tag dijitle/fluent-bit-plugin-loki:$DRONE_COMMIT dijitle/fluent-bit-plugin-loki:0.1
+      - docker login -u $USERNAME -p $PASSWORD
+      - docker push dijitle/fluent-bit-plugin-loki:0.1
+    when:
+      event:
+        - tag
+volumes:
+  - name: dockersock
+    host:
+      path: /var/run/
+---
+kind: signature
+hmac: cfedfad589074ed17e9644192c483583367f5ffd2fb2ce8aac16c44d84af0608
+
+...
