@@ -27,15 +27,13 @@ steps:
       - docker tag dijitle/fluent-bit-plugin-loki:$DRONE_COMMIT dijitle/fluent-bit-plugin-loki:0.1
       - docker login -u $USERNAME -p $PASSWORD
       - docker push dijitle/fluent-bit-plugin-loki:0.1
-    when:
-      event:
-        - tag
+
 volumes:
   - name: dockersock
     host:
       path: /var/run/
 ---
 kind: signature
-hmac: de0f0b46d23c26baf882ea0ecf8c1b4117a2e3027a06df7896b2afd289758f82
+hmac: a51d61f21ce2658380ba6da9739376ac8cbdbc50da5e672536ad8d04f3de13e2
 
 ...
