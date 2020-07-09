@@ -9,8 +9,10 @@ import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/spanlogger"
 	"github.com/go-kit/kit/log/level"
+	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/promql"
 
 	"github.com/grafana/loki/pkg/chunkenc"
 	"github.com/grafana/loki/pkg/iter"
@@ -75,7 +77,7 @@ type batchChunkIterator struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	matchers []*labels.Matcher
-	filter   logql.Filter
+	filter   logql.LineFilter
 	req      *logproto.QueryRequest
 	next     chan *struct {
 		iter iter.EntryIterator
@@ -84,7 +86,7 @@ type batchChunkIterator struct {
 }
 
 // newBatchChunkIterator creates a new batch iterator with the given batchSize.
-func newBatchChunkIterator(ctx context.Context, chunks []*chunkenc.LazyChunk, batchSize int, matchers []*labels.Matcher, filter logql.Filter, req *logproto.QueryRequest) *batchChunkIterator {
+func newBatchChunkIterator(ctx context.Context, chunks []*chunkenc.LazyChunk, batchSize int, matchers []*labels.Matcher, filter logql.LineFilter, req *logproto.QueryRequest) *batchChunkIterator {
 	// __name__ is not something we filter by because it's a constant in loki and only used for upstream compatibility.
 	// Therefore remove it
 	for i := range matchers {
@@ -125,7 +127,7 @@ func newBatchChunkIterator(ctx context.Context, chunks []*chunkenc.LazyChunk, ba
 				}
 				err = next.Close()
 				if err != nil {
-					level.Error(util.Logger).Log("msg", "Failed to close the pre-fetched iterator when pre-fetching was canceled", "err", err)
+					level.Error(util.WithContext(ctx, util.Logger)).Log("msg", "Failed to close the pre-fetched iterator when pre-fetching was canceled", "err", err)
 				}
 				return
 			case res.next <- &struct {
@@ -164,7 +166,7 @@ func (it *batchChunkIterator) nextBatch() (iter.EntryIterator, error) {
 	// the first chunk of the batch
 	headChunk := it.chunks.Peek()
 
-	// pop the next batch of chunks and append/preprend previous overlapping chunks
+	// pop the next batch of chunks and append/prepend previous overlapping chunks
 	// so we can merge/de-dupe overlapping entries.
 	batch := make([]*chunkenc.LazyChunk, 0, it.batchSize+len(it.lastOverlapping))
 	if it.req.Direction == logproto.FORWARD {
@@ -199,7 +201,7 @@ func (it *batchChunkIterator) nextBatch() (iter.EntryIterator, error) {
 		//      │     # 47     │
 		//      └──────────────┘
 		//          ┌──────────────────────────┐
-		//          │           # 48           │
+		//          │           # 48           |
 		//          └──────────────────────────┘
 		//              ┌──────────────┐
 		//              │     # 49     │
@@ -277,7 +279,7 @@ func (it *batchChunkIterator) Close() error {
 }
 
 // newChunksIterator creates an iterator over a set of lazychunks.
-func newChunksIterator(ctx context.Context, chunks []*chunkenc.LazyChunk, matchers []*labels.Matcher, filter logql.Filter, direction logproto.Direction, from, through time.Time) (iter.EntryIterator, error) {
+func newChunksIterator(ctx context.Context, chunks []*chunkenc.LazyChunk, matchers []*labels.Matcher, filter logql.LineFilter, direction logproto.Direction, from, through time.Time) (iter.EntryIterator, error) {
 	chksBySeries := partitionBySeriesChunks(chunks)
 
 	// Make sure the initial chunks are loaded. This is not one chunk
@@ -310,7 +312,7 @@ func newChunksIterator(ctx context.Context, chunks []*chunkenc.LazyChunk, matche
 	return iter.NewHeapIterator(ctx, iters, direction), nil
 }
 
-func buildIterators(ctx context.Context, chks map[model.Fingerprint][][]*chunkenc.LazyChunk, filter logql.Filter, direction logproto.Direction, from, through time.Time) ([]iter.EntryIterator, error) {
+func buildIterators(ctx context.Context, chks map[model.Fingerprint][][]*chunkenc.LazyChunk, filter logql.LineFilter, direction logproto.Direction, from, through time.Time) ([]iter.EntryIterator, error) {
 	result := make([]iter.EntryIterator, 0, len(chks))
 	for _, chunks := range chks {
 		iterator, err := buildHeapIterator(ctx, chunks, filter, direction, from, through)
@@ -323,15 +325,17 @@ func buildIterators(ctx context.Context, chks map[model.Fingerprint][][]*chunken
 	return result, nil
 }
 
-func buildHeapIterator(ctx context.Context, chks [][]*chunkenc.LazyChunk, filter logql.Filter, direction logproto.Direction, from, through time.Time) (iter.EntryIterator, error) {
+func buildHeapIterator(ctx context.Context, chks [][]*chunkenc.LazyChunk, filter logql.LineFilter, direction logproto.Direction, from, through time.Time) (iter.EntryIterator, error) {
 	result := make([]iter.EntryIterator, 0, len(chks))
 
 	// __name__ is only used for upstream compatibility and is hardcoded within loki. Strip it from the return label set.
 	labels := dropLabels(chks[0][0].Chunk.Metric, labels.MetricName).String()
-
 	for i := range chks {
 		iterators := make([]iter.EntryIterator, 0, len(chks[i]))
 		for j := range chks[i] {
+			if !chks[i][j].IsValid {
+				continue
+			}
 			iterator, err := chks[i][j].Iterator(ctx, from, through, direction, filter)
 			if err != nil {
 				return nil, err
@@ -388,7 +392,6 @@ func fetchLazyChunks(ctx context.Context, chunks []*chunkenc.LazyChunk) error {
 	errChan := make(chan error)
 	for fetcher, chunks := range chksByFetcher {
 		go func(fetcher *chunk.Fetcher, chunks []*chunkenc.LazyChunk) {
-
 			keys := make([]string, 0, len(chunks))
 			chks := make([]chunk.Chunk, 0, len(chunks))
 			index := make(map[string]*chunkenc.LazyChunk, len(chunks))
@@ -403,8 +406,14 @@ func fetchLazyChunks(ctx context.Context, chunks []*chunkenc.LazyChunk) error {
 			}
 			chks, err := fetcher.FetchChunks(ctx, chks, keys)
 			if err != nil {
+				if isInvalidChunkError(err) {
+					level.Error(util.Logger).Log("msg", "checksum of chunks does not match", "err", chunk.ErrInvalidChecksum)
+					errChan <- nil
+					return
+				}
 				errChan <- err
 				return
+
 			}
 			// assign fetched chunk by key as FetchChunks doesn't guarantee the order.
 			for _, chk := range chks {
@@ -421,7 +430,25 @@ func fetchLazyChunks(ctx context.Context, chunks []*chunkenc.LazyChunk) error {
 			lastErr = err
 		}
 	}
-	return lastErr
+
+	if lastErr != nil {
+		return lastErr
+	}
+
+	for _, c := range chunks {
+		if c.Chunk.Data != nil {
+			c.IsValid = true
+		}
+	}
+	return nil
+}
+
+func isInvalidChunkError(err error) bool {
+	err = errors.Cause(err)
+	if err, ok := err.(promql.ErrStorage); ok {
+		return err.Err == chunk.ErrInvalidChecksum || err.Err == chunkenc.ErrInvalidChecksum
+	}
+	return false
 }
 
 func loadFirstChunks(ctx context.Context, chks map[model.Fingerprint][][]*chunkenc.LazyChunk) error {

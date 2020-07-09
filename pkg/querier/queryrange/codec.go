@@ -46,6 +46,12 @@ func (r *LokiRequest) WithStartEnd(s int64, e int64) queryrange.Request {
 	return &new
 }
 
+func (r *LokiRequest) WithQuery(query string) queryrange.Request {
+	new := *r
+	new.Query = query
+	return &new
+}
+
 func (codec) DecodeRequest(_ context.Context, r *http.Request) (queryrange.Request, error) {
 	if err := r.ParseForm(); err != nil {
 		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
@@ -160,10 +166,10 @@ func (codec) EncodeResponse(ctx context.Context, res queryrange.Response) (*http
 		return nil, httpgrpc.Errorf(http.StatusInternalServerError, "invalid response format")
 	}
 
-	streams := make([]*logproto.Stream, len(proto.Data.Result))
+	streams := make([]logproto.Stream, len(proto.Data.Result))
 
 	for i, stream := range proto.Data.Result {
-		streams[i] = &logproto.Stream{
+		streams[i] = logproto.Stream{
 			Labels:  stream.Labels,
 			Entries: stream.Entries,
 		}

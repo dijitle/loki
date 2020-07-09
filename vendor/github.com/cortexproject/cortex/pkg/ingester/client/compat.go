@@ -12,17 +12,19 @@ import (
 	jsoniter "github.com/json-iterator/go"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/textparse"
 
 	"github.com/cortexproject/cortex/pkg/util"
 )
 
 var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
-// ToWriteRequest converts matched slices of Labels and Samples into a WriteRequest proto.
+// ToWriteRequest converts matched slices of Labels, Samples and Metadata into a WriteRequest proto.
 // It gets timeseries from the pool, so ReuseSlice() should be called when done.
-func ToWriteRequest(lbls []labels.Labels, samples []Sample, source WriteRequest_SourceEnum) *WriteRequest {
+func ToWriteRequest(lbls []labels.Labels, samples []Sample, metadata []*MetricMetadata, source WriteRequest_SourceEnum) *WriteRequest {
 	req := &WriteRequest{
 		Timeseries: slicePool.Get().([]PreallocTimeseries),
+		Metadata:   metadata,
 		Source:     source,
 	}
 
@@ -135,6 +137,31 @@ func FromMetricsForLabelMatchersResponse(resp *MetricsForLabelMatchersResponse) 
 		metrics = append(metrics, FromLabelAdaptersToMetric(m.Labels))
 	}
 	return metrics
+}
+
+// MetricMetadataMetricTypeToMetricType converts a metric type from our internal client
+// to a Prometheus one.
+func MetricMetadataMetricTypeToMetricType(mt MetricMetadata_MetricType) textparse.MetricType {
+	switch mt {
+	case UNKNOWN:
+		return textparse.MetricTypeUnknown
+	case COUNTER:
+		return textparse.MetricTypeCounter
+	case GAUGE:
+		return textparse.MetricTypeGauge
+	case HISTOGRAM:
+		return textparse.MetricTypeHistogram
+	case GAUGEHISTOGRAM:
+		return textparse.MetricTypeGaugeHistogram
+	case SUMMARY:
+		return textparse.MetricTypeSummary
+	case INFO:
+		return textparse.MetricTypeInfo
+	case STATESET:
+		return textparse.MetricTypeStateset
+	default:
+		return textparse.MetricTypeUnknown
+	}
 }
 
 func toLabelMatchers(matchers []*labels.Matcher) ([]*LabelMatcher, error) {

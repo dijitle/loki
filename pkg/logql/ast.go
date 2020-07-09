@@ -1,10 +1,8 @@
 package logql
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -48,12 +46,9 @@ type Querier interface {
 	Select(context.Context, SelectParams) (iter.EntryIterator, error)
 }
 
-// Filter is a function to filter logs.
-type Filter func(line []byte) bool
-
 // LogSelectorExpr is a LogQL expression filtering and returning logs.
 type LogSelectorExpr interface {
-	Filter() (Filter, error)
+	Filter() (LineFilter, error)
 	Matchers() []*labels.Matcher
 	Expr
 }
@@ -83,7 +78,7 @@ func (e *matchersExpr) String() string {
 	return sb.String()
 }
 
-func (e *matchersExpr) Filter() (Filter, error) {
+func (e *matchersExpr) Filter() (LineFilter, error) {
 	return nil, nil
 }
 
@@ -126,50 +121,25 @@ func (e *filterExpr) String() string {
 	return sb.String()
 }
 
-func (e *filterExpr) Filter() (Filter, error) {
-	var f func([]byte) bool
-	switch e.ty {
-	case labels.MatchRegexp:
-		re, err := regexp.Compile(e.match)
-		if err != nil {
-			return nil, err
-		}
-		f = re.Match
-
-	case labels.MatchNotRegexp:
-		re, err := regexp.Compile(e.match)
-		if err != nil {
-			return nil, err
-		}
-		f = func(line []byte) bool {
-			return !re.Match(line)
-		}
-
-	case labels.MatchEqual:
-		mb := []byte(e.match)
-		f = func(line []byte) bool {
-			return bytes.Contains(line, mb)
-		}
-
-	case labels.MatchNotEqual:
-		mb := []byte(e.match)
-		f = func(line []byte) bool {
-			return !bytes.Contains(line, mb)
-		}
-
-	default:
-		return nil, fmt.Errorf("unknown matcher: %v", e.match)
+func (e *filterExpr) Filter() (LineFilter, error) {
+	f, err := newFilter(e.match, e.ty)
+	if err != nil {
+		return nil, err
 	}
-	next, ok := e.left.(*filterExpr)
-	if ok {
-		nextFilter, err := next.Filter()
+	if nextExpr, ok := e.left.(*filterExpr); ok {
+		nextFilter, err := nextExpr.Filter()
 		if err != nil {
 			return nil, err
 		}
-		return func(line []byte) bool {
-			return nextFilter(line) && f(line)
-		}, nil
+		if nextFilter != nil {
+			f = newAndFilter(nextFilter, f)
+		}
 	}
+
+	if f == TrueFilter {
+		return nil, nil
+	}
+
 	return f, nil
 }
 
@@ -216,15 +186,18 @@ func addFilterToLogRangeExpr(left *logRange, ty labels.MatchType, match string) 
 }
 
 const (
-	OpTypeSum           = "sum"
-	OpTypeAvg           = "avg"
-	OpTypeMax           = "max"
-	OpTypeMin           = "min"
-	OpTypeCount         = "count"
-	OpTypeStddev        = "stddev"
-	OpTypeStdvar        = "stdvar"
-	OpTypeBottomK       = "bottomk"
-	OpTypeTopK          = "topk"
+	// vector ops
+	OpTypeSum     = "sum"
+	OpTypeAvg     = "avg"
+	OpTypeMax     = "max"
+	OpTypeMin     = "min"
+	OpTypeCount   = "count"
+	OpTypeStddev  = "stddev"
+	OpTypeStdvar  = "stdvar"
+	OpTypeBottomK = "bottomk"
+	OpTypeTopK    = "topk"
+
+	// range vector ops
 	OpTypeCountOverTime = "count_over_time"
 	OpTypeRate          = "rate"
 
@@ -251,6 +224,8 @@ func IsLogicalBinOp(op string) bool {
 type SampleExpr interface {
 	// Selector is the LogQL selector to apply when retrieving logs.
 	Selector() LogSelectorExpr
+	// Operations returns the list of operations used in this SampleExpr
+	Operations() []string
 	Expr
 }
 
@@ -276,6 +251,11 @@ func (e *rangeAggregationExpr) logQLExpr() {}
 // impls Stringer
 func (e *rangeAggregationExpr) String() string {
 	return formatOperation(e.operation, nil, e.left.String())
+}
+
+// impl SampleExpr
+func (e *rangeAggregationExpr) Operations() []string {
+	return []string{e.operation}
 }
 
 type grouping struct {
@@ -354,6 +334,11 @@ func (e *vectorAggregationExpr) String() string {
 	return formatOperation(e.operation, e.grouping, params...)
 }
 
+// impl SampleExpr
+func (e *vectorAggregationExpr) Operations() []string {
+	return append(e.left.Operations(), e.operation)
+}
+
 type binOpExpr struct {
 	SampleExpr
 	RHS SampleExpr
@@ -362,6 +347,12 @@ type binOpExpr struct {
 
 func (e *binOpExpr) String() string {
 	return fmt.Sprintf("%s %s %s", e.SampleExpr.String(), e.op, e.RHS.String())
+}
+
+// impl SampleExpr
+func (e *binOpExpr) Operations() []string {
+	ops := append(e.SampleExpr.Operations(), e.RHS.Operations()...)
+	return append(ops, e.op)
 }
 
 func mustNewBinOpExpr(op string, lhs, rhs Expr) SampleExpr {
@@ -416,11 +407,11 @@ func mustNewBinOpExpr(op string, lhs, rhs Expr) SampleExpr {
 	}
 }
 
-// Reduces a binary operation expression. A binop is reducable if both of its legs are literal expressions.
+// Reduces a binary operation expression. A binop is reducible if both of its legs are literal expressions.
 // This is because literals need match all labels, which is currently difficult to encode into StepEvaluators.
 // Therefore, we ensure a binop can be reduced/simplified, maintaining the invariant that it does not have two literal legs.
 func reduceBinOp(op string, left, right *literalExpr) *literalExpr {
-	merged := (&defaultEvaluator{}).mergeBinOp(
+	merged := mergeBinOp(
 		op,
 		&promql.Sample{Point: promql.Point{V: left.value}},
 		&promql.Sample{Point: promql.Point{V: right.value}},
@@ -457,7 +448,8 @@ func (e *literalExpr) String() string {
 // to facilitate sum types. We'll be type switching when evaluating them anyways
 // and they will only be present in binary operation legs.
 func (e *literalExpr) Selector() LogSelectorExpr   { return e }
-func (e *literalExpr) Filter() (Filter, error)     { return nil, nil }
+func (e *literalExpr) Operations() []string        { return nil }
+func (e *literalExpr) Filter() (LineFilter, error) { return nil, nil }
 func (e *literalExpr) Matchers() []*labels.Matcher { return nil }
 
 // helper used to impl Stringer for vector and range aggregations

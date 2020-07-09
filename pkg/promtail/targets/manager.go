@@ -3,6 +3,7 @@ package targets
 import (
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 
 	"github.com/grafana/loki/pkg/promtail/api"
@@ -37,7 +38,8 @@ func NewTargetManagers(
 	var journalScrapeConfigs []scrape.Config
 	var syslogScrapeConfigs []scrape.Config
 
-	if isStdinPipe() {
+	if targetConfig.Stdin {
+		level.Debug(util.Logger).Log("msg", "configured to read from stdin")
 		stdin, err := newStdinTargetManager(app, client, scrapeConfigs)
 		if err != nil {
 			return nil, err

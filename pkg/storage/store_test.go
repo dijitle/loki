@@ -2,23 +2,30 @@ package storage
 
 import (
 	"context"
+	"io/ioutil"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
+	"path"
 	"runtime"
 	"testing"
 	"time"
 
 	"github.com/prometheus/common/model"
+	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/chunk/local"
+	cortex_local "github.com/cortexproject/cortex/pkg/chunk/local"
 	"github.com/cortexproject/cortex/pkg/chunk/storage"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 
 	"github.com/grafana/loki/pkg/iter"
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logql"
+	"github.com/grafana/loki/pkg/logql/marshal"
+	"github.com/grafana/loki/pkg/storage/stores/local"
 	"github.com/grafana/loki/pkg/util/validation"
 )
 
@@ -147,8 +154,8 @@ func getLocalStore() Store {
 	}
 	store, err := NewStore(Config{
 		Config: storage.Config{
-			BoltDBConfig: local.BoltDBConfig{Directory: "/tmp/benchmark/index"},
-			FSConfig:     local.FSConfig{Directory: "/tmp/benchmark/chunks"},
+			BoltDBConfig: cortex_local.BoltDBConfig{Directory: "/tmp/benchmark/index"},
+			FSConfig:     cortex_local.FSConfig{Directory: "/tmp/benchmark/chunks"},
 		},
 		MaxChunkBatchSize: 10,
 	}, chunk.StoreConfig{}, chunk.SchemaConfig{
@@ -164,7 +171,7 @@ func getLocalStore() Store {
 				},
 			},
 		},
-	}, limits)
+	}, limits, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -176,12 +183,12 @@ func Test_store_LazyQuery(t *testing.T) {
 	tests := []struct {
 		name     string
 		req      *logproto.QueryRequest
-		expected []*logproto.Stream
+		expected []logproto.Stream
 	}{
 		{
 			"all",
 			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD),
-			[]*logproto.Stream{
+			[]logproto.Stream{
 				{
 					Labels: "{foo=\"bar\"}",
 					Entries: []logproto.Entry{
@@ -249,7 +256,7 @@ func Test_store_LazyQuery(t *testing.T) {
 		{
 			"filter regex",
 			newQuery("{foo=~\"ba.*\"} |~ \"1|2|3\" !~ \"2|3\"", from, from.Add(6*time.Millisecond), logproto.FORWARD),
-			[]*logproto.Stream{
+			[]logproto.Stream{
 				{
 					Labels: "{foo=\"bar\"}",
 					Entries: []logproto.Entry{
@@ -273,7 +280,7 @@ func Test_store_LazyQuery(t *testing.T) {
 		{
 			"filter matcher",
 			newQuery("{foo=\"bar\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD),
-			[]*logproto.Stream{
+			[]logproto.Stream{
 				{
 					Labels: "{foo=\"bar\"}",
 					Entries: []logproto.Entry{
@@ -310,7 +317,7 @@ func Test_store_LazyQuery(t *testing.T) {
 		{
 			"filter time",
 			newQuery("{foo=~\"ba.*\"}", from, from.Add(time.Millisecond), logproto.FORWARD),
-			[]*logproto.Stream{
+			[]logproto.Stream{
 				{
 					Labels: "{foo=\"bar\"}",
 					Entries: []logproto.Entry{
@@ -340,12 +347,14 @@ func Test_store_LazyQuery(t *testing.T) {
 					MaxChunkBatchSize: 10,
 				},
 			}
+
 			ctx = user.InjectOrgID(context.Background(), "test-user")
 			it, err := s.LazyQuery(ctx, logql.SelectParams{QueryRequest: tt.req})
 			if err != nil {
 				t.Errorf("store.LazyQuery() error = %v", err)
 				return
 			}
+
 			streams, _, err := iter.ReadBatch(it, tt.req.Limit)
 			_ = it.Close()
 			if err != nil {
@@ -354,4 +363,210 @@ func Test_store_LazyQuery(t *testing.T) {
 			assertStream(t, tt.expected, streams.Streams)
 		})
 	}
+}
+
+func Test_store_GetSeries(t *testing.T) {
+
+	tests := []struct {
+		name      string
+		req       *logproto.QueryRequest
+		expected  []logproto.SeriesIdentifier
+		batchSize int
+	}{
+		{
+			"all",
+			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD),
+			[]logproto.SeriesIdentifier{
+				{Labels: mustParseLabels("{foo=\"bar\"}")},
+				{Labels: mustParseLabels("{foo=\"bazz\"}")},
+			},
+			1,
+		},
+		{
+			"all-single-batch",
+			newQuery("{foo=~\"ba.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD),
+			[]logproto.SeriesIdentifier{
+				{Labels: mustParseLabels("{foo=\"bar\"}")},
+				{Labels: mustParseLabels("{foo=\"bazz\"}")},
+			},
+			5,
+		},
+		{
+			"regexp filter (post chunk fetching)",
+			newQuery("{foo=~\"bar.*\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD),
+			[]logproto.SeriesIdentifier{
+				{Labels: mustParseLabels("{foo=\"bar\"}")},
+			},
+			1,
+		},
+		{
+			"filter matcher",
+			newQuery("{foo=\"bar\"}", from, from.Add(6*time.Millisecond), logproto.FORWARD),
+			[]logproto.SeriesIdentifier{
+				{Labels: mustParseLabels("{foo=\"bar\"}")},
+			},
+			1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &store{
+				Store: storeFixture,
+				cfg: Config{
+					MaxChunkBatchSize: tt.batchSize,
+				},
+			}
+			ctx = user.InjectOrgID(context.Background(), "test-user")
+			out, err := s.GetSeries(ctx, logql.SelectParams{QueryRequest: tt.req})
+			if err != nil {
+				t.Errorf("store.GetSeries() error = %v", err)
+				return
+			}
+			require.Equal(t, tt.expected, out)
+		})
+	}
+}
+
+type timeRange struct {
+	from, to time.Time
+}
+
+func TestStore_MultipleBoltDBShippersInConfig(t *testing.T) {
+	tempDir, err := ioutil.TempDir("", "multiple-boltdb-shippers")
+	require.NoError(t, err)
+
+	defer func() {
+		require.NoError(t, os.RemoveAll(tempDir))
+	}()
+
+	limits, err := validation.NewOverrides(validation.Limits{}, nil)
+	require.NoError(t, err)
+
+	// config for BoltDB Shipper
+	boltdbShipperConfig := local.ShipperConfig{}
+	flagext.DefaultValues(&boltdbShipperConfig)
+	boltdbShipperConfig.ActiveIndexDirectory = path.Join(tempDir, "index")
+	boltdbShipperConfig.SharedStoreType = "filesystem"
+	boltdbShipperConfig.CacheLocation = path.Join(tempDir, "boltdb-shipper-cache")
+
+	// dates for activation of boltdb shippers
+	firstStoreDate := parseDate("2019-01-01")
+	secondStoreDate := parseDate("2019-01-02")
+
+	config := Config{
+		Config: storage.Config{
+			FSConfig: cortex_local.FSConfig{Directory: path.Join(tempDir, "chunks")},
+		},
+		BoltDBShipperConfig: boltdbShipperConfig,
+	}
+
+	RegisterCustomIndexClients(config, nil)
+
+	store, err := NewStore(config, chunk.StoreConfig{}, chunk.SchemaConfig{
+		Configs: []chunk.PeriodConfig{
+			{
+				From:       chunk.DayTime{Time: timeToModelTime(firstStoreDate)},
+				IndexType:  "boltdb-shipper",
+				ObjectType: "filesystem",
+				Schema:     "v9",
+				IndexTables: chunk.PeriodicTableConfig{
+					Prefix: "index_",
+					Period: time.Hour * 168,
+				},
+			},
+			{
+				From:       chunk.DayTime{Time: timeToModelTime(secondStoreDate)},
+				IndexType:  "boltdb-shipper",
+				ObjectType: "filesystem",
+				Schema:     "v11",
+				IndexTables: chunk.PeriodicTableConfig{
+					Prefix: "index_",
+					Period: time.Hour * 168,
+				},
+				RowShards: 2,
+			},
+		},
+	}, limits, nil)
+	require.NoError(t, err)
+
+	// time ranges adding a chunk for each store and a chunk which overlaps both the stores
+	chunksToBuildForTimeRanges := []timeRange{
+		{
+			// chunk just for first store
+			secondStoreDate.Add(-3 * time.Hour),
+			secondStoreDate.Add(-2 * time.Hour),
+		},
+		{
+			// chunk overlapping both the stores
+			secondStoreDate.Add(-time.Hour),
+			secondStoreDate.Add(time.Hour),
+		},
+		{
+			// chunk just for second store
+			secondStoreDate.Add(2 * time.Hour),
+			secondStoreDate.Add(3 * time.Hour),
+		},
+	}
+
+	// build and add chunks to the store
+	addedChunkIDs := map[string]struct{}{}
+	for _, tr := range chunksToBuildForTimeRanges {
+		chk := newChunk(buildTestStreams(fooLabelsWithName, tr))
+
+		err := store.PutOne(ctx, chk.From, chk.Through, chk)
+		require.NoError(t, err)
+
+		addedChunkIDs[chk.ExternalKey()] = struct{}{}
+	}
+
+	// get all the chunks from both the stores
+	chunks, err := store.Get(ctx, "fake", timeToModelTime(firstStoreDate), timeToModelTime(secondStoreDate.Add(24*time.Hour)), newMatchers(fooLabelsWithName)...)
+	require.NoError(t, err)
+
+	// we get common chunk twice because it is indexed in both the stores
+	require.Len(t, chunks, len(addedChunkIDs)+1)
+
+	// check whether we got back all the chunks which were added
+	for i := range chunks {
+		_, ok := addedChunkIDs[chunks[i].ExternalKey()]
+		require.True(t, ok)
+	}
+}
+
+func mustParseLabels(s string) map[string]string {
+	l, err := marshal.NewLabelSet(s)
+
+	if err != nil {
+		log.Fatalf("Failed to parse %s", s)
+	}
+
+	return l
+}
+
+func parseDate(in string) time.Time {
+	t, err := time.Parse("2006-01-02", in)
+	if err != nil {
+		panic(err)
+	}
+	return t
+}
+
+func buildTestStreams(labels string, tr timeRange) logproto.Stream {
+	stream := logproto.Stream{
+		Labels:  labels,
+		Entries: []logproto.Entry{},
+	}
+
+	for from := tr.from; from.Before(tr.to); from = from.Add(time.Second) {
+		stream.Entries = append(stream.Entries, logproto.Entry{
+			Timestamp: from,
+			Line:      from.String(),
+		})
+	}
+
+	return stream
+}
+
+func timeToModelTime(t time.Time) model.Time {
+	return model.TimeFromUnixNano(t.UnixNano())
 }

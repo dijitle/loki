@@ -1,20 +1,25 @@
 package queryrange
 
 import (
+	"bytes"
 	"context"
+	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/cortexproject/cortex/pkg/chunk/cache"
+	"github.com/cortexproject/cortex/pkg/querier/frontend"
 	"github.com/cortexproject/cortex/pkg/querier/queryrange"
 	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/stretchr/testify/require"
+	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/middleware"
 	"github.com/weaveworks/common/user"
 
@@ -35,8 +40,8 @@ var (
 			CacheConfig: cache.Config{
 				EnableFifoCache: true,
 				Fifocache: cache.FifoCacheConfig{
-					Size:     1024,
-					Validity: 24 * time.Hour,
+					MaxSizeItems: 1024,
+					Validity:     24 * time.Hour,
 				},
 			},
 		},
@@ -75,7 +80,7 @@ var (
 // those tests are mostly for testing the glue between all component and make sure they activate correctly.
 func TestMetricsTripperware(t *testing.T) {
 
-	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{})
+	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{}, nil)
 	if stopper != nil {
 		defer stopper.Stop()
 	}
@@ -139,7 +144,7 @@ func TestMetricsTripperware(t *testing.T) {
 
 func TestLogFilterTripperware(t *testing.T) {
 
-	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{})
+	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{}, nil)
 	if stopper != nil {
 		defer stopper.Stop()
 	}
@@ -186,7 +191,7 @@ func TestLogFilterTripperware(t *testing.T) {
 }
 
 func TestLogNoRegex(t *testing.T) {
-	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{})
+	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{}, nil)
 	if stopper != nil {
 		defer stopper.Stop()
 	}
@@ -220,7 +225,7 @@ func TestLogNoRegex(t *testing.T) {
 }
 
 func TestUnhandledPath(t *testing.T) {
-	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{})
+	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{}, nil)
 	if stopper != nil {
 		defer stopper.Stop()
 	}
@@ -244,7 +249,7 @@ func TestUnhandledPath(t *testing.T) {
 }
 
 func TestRegexpParamsSupport(t *testing.T) {
-	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{})
+	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{}, nil)
 	if stopper != nil {
 		defer stopper.Stop()
 	}
@@ -286,9 +291,100 @@ func TestRegexpParamsSupport(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestPostQueries(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "/loki/api/v1/query_range", nil)
+	data := url.Values{
+		"query": {`{app="foo"} |~ "foo"`},
+	}
+	body := bytes.NewBufferString(data.Encode())
+	req.Body = ioutil.NopCloser(body)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Add("Content-Length", strconv.Itoa(len(data.Encode())))
+	req = req.WithContext(user.InjectOrgID(context.Background(), "1"))
+	require.NoError(t, err)
+	_, err = newRoundTripper(
+		frontend.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Error("unexpected default roundtripper called")
+			return nil, nil
+		}),
+		frontend.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, nil
+		}),
+		frontend.RoundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Error("unexpected metric roundtripper called")
+			return nil, nil
+		}),
+		fakeLimits{},
+	).RoundTrip(req)
+	require.NoError(t, err)
+}
+
+func TestEntriesLimitsTripperware(t *testing.T) {
+	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{maxEntriesLimitPerQuery: 5000}, nil)
+	if stopper != nil {
+		defer stopper.Stop()
+	}
+	require.NoError(t, err)
+	rt, err := newfakeRoundTripper()
+	require.NoError(t, err)
+	defer rt.Close()
+
+	lreq := &LokiRequest{
+		Query:     `{app="foo"}`, // no regex so it should go to the querier
+		Limit:     10000,
+		StartTs:   testTime.Add(-6 * time.Hour),
+		EndTs:     testTime,
+		Direction: logproto.FORWARD,
+		Path:      "/loki/api/v1/query_range",
+	}
+
+	ctx := user.InjectOrgID(context.Background(), "1")
+	req, err := lokiCodec.EncodeRequest(ctx, lreq)
+	require.NoError(t, err)
+
+	req = req.WithContext(ctx)
+	err = user.InjectOrgIDIntoHTTPRequest(ctx, req)
+	require.NoError(t, err)
+
+	_, err = tpw(rt).RoundTrip(req)
+	require.Equal(t, httpgrpc.Errorf(http.StatusBadRequest, "max entries limit per query exceeded, limit > max_entries_limit (10000 > 5000)"), err)
+}
+
+func TestEntriesLimitWithZeroTripperware(t *testing.T) {
+	tpw, stopper, err := NewTripperware(testConfig, util.Logger, fakeLimits{}, nil)
+	if stopper != nil {
+		defer stopper.Stop()
+	}
+	require.NoError(t, err)
+	rt, err := newfakeRoundTripper()
+	require.NoError(t, err)
+	defer rt.Close()
+
+	lreq := &LokiRequest{
+		Query:     `{app="foo"}`, // no regex so it should go to the querier
+		Limit:     10000,
+		StartTs:   testTime.Add(-6 * time.Hour),
+		EndTs:     testTime,
+		Direction: logproto.FORWARD,
+		Path:      "/loki/api/v1/query_range",
+	}
+
+	ctx := user.InjectOrgID(context.Background(), "1")
+	req, err := lokiCodec.EncodeRequest(ctx, lreq)
+	require.NoError(t, err)
+
+	req = req.WithContext(ctx)
+	err = user.InjectOrgIDIntoHTTPRequest(ctx, req)
+	require.NoError(t, err)
+
+	_, err = tpw(rt).RoundTrip(req)
+	require.NoError(t, err)
+}
+
 type fakeLimits struct {
-	maxQueryParallelism int
-	splits              map[string]time.Duration
+	maxQueryParallelism     int
+	maxEntriesLimitPerQuery int
+	splits                  map[string]time.Duration
 }
 
 func (f fakeLimits) QuerySplitDuration(key string) time.Duration {
@@ -307,6 +403,10 @@ func (f fakeLimits) MaxQueryParallelism(string) int {
 		return 1
 	}
 	return f.maxQueryParallelism
+}
+
+func (f fakeLimits) MaxEntriesLimitPerQuery(string) int {
+	return f.maxEntriesLimitPerQuery
 }
 
 func counter() (*int, http.Handler) {

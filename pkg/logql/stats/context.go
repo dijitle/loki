@@ -68,8 +68,8 @@ func (r Result) Log(log log.Logger) {
 
 func (s Summary) Log(log log.Logger) {
 	_ = log.Log(
-		"Summary.BytesProcessedPerSeconds", humanize.Bytes(uint64(s.BytesProcessedPerSeconds)),
-		"Summary.LinesProcessedPerSeconds", s.LinesProcessedPerSeconds,
+		"Summary.BytesProcessedPerSecond", humanize.Bytes(uint64(s.BytesProcessedPerSecond)),
+		"Summary.LinesProcessedPerSecond", s.LinesProcessedPerSecond,
 		"Summary.TotalBytesProcessed", humanize.Bytes(uint64(s.TotalBytesProcessed)),
 		"Summary.TotalLinesProcessed", s.TotalLinesProcessed,
 		"Summary.ExecTime", time.Duration(int64(s.ExecTime*float64(time.Second))),
@@ -138,9 +138,8 @@ func GetStoreData(ctx context.Context) *StoreData {
 
 // Snapshot compute query statistics from a context using the total exec time.
 func Snapshot(ctx context.Context, execTime time.Duration) Result {
-	var res Result
 	// ingester data is decoded from grpc trailers.
-	res.Ingester = decodeTrailers(ctx)
+	res := decodeTrailers(ctx)
 	// collect data from store.
 	s, ok := ctx.Value(storeKey).(*StoreData)
 	if ok {
@@ -171,10 +170,10 @@ func (r *Result) ComputeSummary(execTime time.Duration) {
 		r.Ingester.DecompressedLines + r.Ingester.HeadChunkLines
 	r.Summary.ExecTime = execTime.Seconds()
 	if execTime != 0 {
-		r.Summary.BytesProcessedPerSeconds =
+		r.Summary.BytesProcessedPerSecond =
 			int64(float64(r.Summary.TotalBytesProcessed) /
 				execTime.Seconds())
-		r.Summary.LinesProcessedPerSeconds =
+		r.Summary.LinesProcessedPerSecond =
 			int64(float64(r.Summary.TotalLinesProcessed) /
 				execTime.Seconds())
 	}

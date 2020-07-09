@@ -21,6 +21,63 @@ func TestParse(t *testing.T) {
 		err error
 	}{
 		{
+			// raw string
+			in: "count_over_time({foo=~`bar\\w+`}[12h] |~ `error\\`)",
+			exp: &rangeAggregationExpr{
+				operation: "count_over_time",
+				left: &logRange{
+					left: &filterExpr{
+						ty:    labels.MatchRegexp,
+						match: "error\\",
+						left: &matchersExpr{
+							matchers: []*labels.Matcher{
+								mustNewMatcher(labels.MatchRegexp, "foo", "bar\\w+"),
+							},
+						},
+					},
+					interval: 12 * time.Hour,
+				},
+			},
+		},
+		{
+			// test [12h] before filter expr
+			in: `count_over_time({foo="bar"}[12h] |= "error")`,
+			exp: &rangeAggregationExpr{
+				operation: "count_over_time",
+				left: &logRange{
+					left: &filterExpr{
+						ty:    labels.MatchEqual,
+						match: "error",
+						left: &matchersExpr{
+							matchers: []*labels.Matcher{
+								mustNewMatcher(labels.MatchEqual, "foo", "bar"),
+							},
+						},
+					},
+					interval: 12 * time.Hour,
+				},
+			},
+		},
+		{
+			// test [12h] after filter expr
+			in: `count_over_time({foo="bar"} |= "error" [12h])`,
+			exp: &rangeAggregationExpr{
+				operation: "count_over_time",
+				left: &logRange{
+					left: &filterExpr{
+						ty:    labels.MatchEqual,
+						match: "error",
+						left: &matchersExpr{
+							matchers: []*labels.Matcher{
+								mustNewMatcher(labels.MatchEqual, "foo", "bar"),
+							},
+						},
+					},
+					interval: 12 * time.Hour,
+				},
+			},
+		},
+		{
 			in:  `{foo="bar"}`,
 			exp: &matchersExpr{matchers: []*labels.Matcher{mustNewMatcher(labels.MatchEqual, "foo", "bar")}},
 		},
@@ -196,9 +253,9 @@ func TestParse(t *testing.T) {
 		{
 			in: `min({ foo !~ "bar" }[5m])`,
 			err: ParseError{
-				msg:  "syntax error: unexpected {",
-				line: 1,
-				col:  5,
+				msg:  "syntax error: unexpected DURATION",
+				line: 0,
+				col:  21,
 			},
 		},
 		{
@@ -236,9 +293,9 @@ func TestParse(t *testing.T) {
 		{
 			in: `stddev({ foo !~ "bar" })`,
 			err: ParseError{
-				msg:  "syntax error: unexpected {",
+				msg:  "syntax error: unexpected )",
 				line: 1,
-				col:  8,
+				col:  24,
 			},
 		},
 		{
@@ -620,10 +677,10 @@ func TestParse(t *testing.T) {
 		},
 		{
 			in: `
-			sum(count_over_time({foo="bar"}[5m])) by (foo) ^
-			sum(count_over_time({foo="bar"}[5m])) by (foo) /
-			sum(count_over_time({foo="bar"}[5m])) by (foo)
-			`,
+					sum(count_over_time({foo="bar"}[5m])) by (foo) ^
+					sum(count_over_time({foo="bar"}[5m])) by (foo) /
+					sum(count_over_time({foo="bar"}[5m])) by (foo)
+					`,
 			exp: mustNewBinOpExpr(
 				OpTypeDiv,
 				mustNewBinOpExpr(
@@ -682,10 +739,10 @@ func TestParse(t *testing.T) {
 		{
 			// operator precedence before left associativity
 			in: `
-			sum(count_over_time({foo="bar"}[5m])) by (foo) +
-			sum(count_over_time({foo="bar"}[5m])) by (foo) /
-			sum(count_over_time({foo="bar"}[5m])) by (foo)
-			`,
+					sum(count_over_time({foo="bar"}[5m])) by (foo) +
+					sum(count_over_time({foo="bar"}[5m])) by (foo) /
+					sum(count_over_time({foo="bar"}[5m])) by (foo)
+					`,
 			exp: mustNewBinOpExpr(
 				OpTypeAdd,
 				mustNewVectorAggregationExpr(newRangeAggregationExpr(
@@ -739,6 +796,70 @@ func TestParse(t *testing.T) {
 						nil,
 					),
 				),
+			),
+		},
+		{
+			in: `sum by (job) (
+							count_over_time({namespace="tns"} |= "level=error"[5m])
+						/
+							count_over_time({namespace="tns"}[5m])
+						)`,
+			exp: mustNewVectorAggregationExpr(
+				mustNewBinOpExpr(OpTypeDiv,
+					newRangeAggregationExpr(
+						&logRange{
+							left: &filterExpr{
+								left: &matchersExpr{
+									matchers: []*labels.Matcher{
+										mustNewMatcher(labels.MatchEqual, "namespace", "tns"),
+									},
+								},
+								match: "level=error",
+								ty:    labels.MatchEqual,
+							},
+							interval: 5 * time.Minute,
+						}, OpTypeCountOverTime),
+					newRangeAggregationExpr(
+						&logRange{
+							left: &matchersExpr{
+								matchers: []*labels.Matcher{
+									mustNewMatcher(labels.MatchEqual, "namespace", "tns"),
+								},
+							},
+							interval: 5 * time.Minute,
+						}, OpTypeCountOverTime)), OpTypeSum, &grouping{groups: []string{"job"}}, nil),
+		},
+		{
+			in: `sum by (job) (
+							count_over_time({namespace="tns"} |= "level=error"[5m])
+						/
+							count_over_time({namespace="tns"}[5m])
+						) * 100`,
+			exp: mustNewBinOpExpr(OpTypeMul, mustNewVectorAggregationExpr(
+				mustNewBinOpExpr(OpTypeDiv,
+					newRangeAggregationExpr(
+						&logRange{
+							left: &filterExpr{
+								left: &matchersExpr{
+									matchers: []*labels.Matcher{
+										mustNewMatcher(labels.MatchEqual, "namespace", "tns"),
+									},
+								},
+								match: "level=error",
+								ty:    labels.MatchEqual,
+							},
+							interval: 5 * time.Minute,
+						}, OpTypeCountOverTime),
+					newRangeAggregationExpr(
+						&logRange{
+							left: &matchersExpr{
+								matchers: []*labels.Matcher{
+									mustNewMatcher(labels.MatchEqual, "namespace", "tns"),
+								},
+							},
+							interval: 5 * time.Minute,
+						}, OpTypeCountOverTime)), OpTypeSum, &grouping{groups: []string{"job"}}, nil),
+				mustNewLiteralExpr("100", false),
 			),
 		},
 		{

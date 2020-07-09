@@ -8,20 +8,21 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/health/grpc_health_v1"
-
 	"github.com/cortexproject/cortex/pkg/ring"
 	"github.com/cortexproject/cortex/pkg/ring/kv"
-	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
+	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/services"
+
+	"github.com/go-kit/kit/log/level"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/weaveworks/common/user"
-
 	"golang.org/x/net/context"
+	"google.golang.org/grpc"
 
 	"github.com/grafana/loki/pkg/ingester/client"
 	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/pkg/logql"
 )
 
 func TestTransferOut(t *testing.T) {
@@ -32,7 +33,7 @@ func TestTransferOut(t *testing.T) {
 	// Push some data into our original ingester
 	ctx := user.InjectOrgID(context.Background(), "test")
 	_, err := ing.Push(ctx, &logproto.PushRequest{
-		Streams: []*logproto.Stream{
+		Streams: []logproto.Stream{
 			{
 				Entries: []logproto.Entry{
 					{Line: "line 0", Timestamp: time.Unix(0, 0)},
@@ -58,7 +59,7 @@ func TestTransferOut(t *testing.T) {
 
 	// verify we get out of order exception on adding an entry with older timestamps
 	_, err2 := ing.Push(ctx, &logproto.PushRequest{
-		Streams: []*logproto.Stream{
+		Streams: []logproto.Stream{
 			{
 				Entries: []logproto.Entry{
 					{Line: "out of order line", Timestamp: time.Unix(0, 0)},
@@ -75,7 +76,8 @@ func TestTransferOut(t *testing.T) {
 
 	// Create a new ingester and transfer data to it
 	ing2 := f.getIngester(time.Second*60, t)
-	ing.Shutdown()
+	defer services.StopAndAwaitTerminated(context.Background(), ing2) //nolint:errcheck
+	require.NoError(t, services.StopAndAwaitTerminated(context.Background(), ing))
 
 	assert.Len(t, ing2.instances, 1)
 	if assert.Contains(t, ing2.instances, "test") {
@@ -90,7 +92,7 @@ func TestTransferOut(t *testing.T) {
 				time.Unix(0, 0),
 				time.Unix(10, 0),
 				logproto.FORWARD,
-				func([]byte) bool { return true },
+				logql.LineFilterFunc(func([]byte) bool { return true }),
 			)
 			if !assert.NoError(t, err) {
 				continue
@@ -120,7 +122,7 @@ type testIngesterFactory struct {
 }
 
 func newTestIngesterFactory(t *testing.T) *testIngesterFactory {
-	kvClient, err := kv.NewClient(kv.Config{Store: "inmemory"}, codec.Proto{Factory: ring.ProtoDescFactory})
+	kvClient, err := kv.NewClient(kv.Config{Store: "inmemory"}, ring.GetCodec())
 	require.NoError(t, err)
 
 	return &testIngesterFactory{
@@ -140,19 +142,13 @@ func (f *testIngesterFactory) getIngester(joinAfter time.Duration, t *testing.T)
 	cfg.LifecyclerConfig.JoinAfter = joinAfter
 	cfg.LifecyclerConfig.Addr = cfg.LifecyclerConfig.ID
 
-	cfg.ingesterClientFactory = func(cfg client.Config, addr string) (grpc_health_v1.HealthClient, error) {
+	cfg.ingesterClientFactory = func(cfg client.Config, addr string) (client.HealthAndIngesterClient, error) {
 		ingester, ok := f.ingesters[addr]
 		if !ok {
 			return nil, fmt.Errorf("no ingester %s", addr)
 		}
 
-		return struct {
-			logproto.PusherClient
-			logproto.QuerierClient
-			logproto.IngesterClient
-			grpc_health_v1.HealthClient
-			io.Closer
-		}{
+		return client.ClosableHealthAndIngesterClient{
 			PusherClient:   nil,
 			QuerierClient:  nil,
 			IngesterClient: &testIngesterClient{t: f.t, i: ingester},
@@ -196,7 +192,11 @@ func (c *testIngesterClient) TransferChunks(context.Context, ...grpc.CallOption)
 	// unhealthy state, permanently stuck in the handler for claiming tokens.
 	go func() {
 		time.Sleep(time.Millisecond * 50)
-		c.i.lifecycler.Shutdown()
+		c.i.stopIncomingRequests() // used to be called from lifecycler, now it must be called *before* stopping lifecyler. (ingester does this on shutdown)
+		err := services.StopAndAwaitTerminated(context.Background(), c.i.lifecycler)
+		if err != nil {
+			level.Error(util.Logger).Log("msg", "lifecycler failed", "err", err)
+		}
 	}()
 
 	go func() {

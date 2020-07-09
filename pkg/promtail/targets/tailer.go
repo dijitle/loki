@@ -69,7 +69,7 @@ func newTailer(logger log.Logger, handler api.EntryHandler, positions positions.
 		quit: make(chan struct{}),
 		done: make(chan struct{}),
 	}
-	tail.Logger = util.NewLogAdapater(logger)
+	tail.Logger = util.NewLogAdapter(logger)
 
 	go tailer.run()
 	filesActive.Add(1.)
@@ -147,6 +147,7 @@ func (t *tailer) stop() error {
 	<-t.done
 	filesActive.Add(-1.)
 	// When we stop tailing the file, also un-export metrics related to the file
+	readLines.DeleteLabelValues(t.path)
 	readBytes.DeleteLabelValues(t.path)
 	totalBytes.DeleteLabelValues(t.path)
 	logLengthHistogram.DeleteLabelValues(t.path)

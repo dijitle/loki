@@ -1,9 +1,12 @@
 package cassandra
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"strings"
 	"time"
 
@@ -12,27 +15,31 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/chunk"
 	"github.com/cortexproject/cortex/pkg/chunk/util"
+	pkgutil "github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/flagext"
 )
 
 // Config for a StorageClient
 type Config struct {
-	Addresses                string        `yaml:"addresses,omitempty"`
-	Port                     int           `yaml:"port,omitempty"`
-	Keyspace                 string        `yaml:"keyspace,omitempty"`
-	Consistency              string        `yaml:"consistency,omitempty"`
-	ReplicationFactor        int           `yaml:"replication_factor,omitempty"`
-	DisableInitialHostLookup bool          `yaml:"disable_initial_host_lookup,omitempty"`
-	SSL                      bool          `yaml:"SSL,omitempty"`
-	HostVerification         bool          `yaml:"host_verification,omitempty"`
-	CAPath                   string        `yaml:"CA_path,omitempty"`
-	Auth                     bool          `yaml:"auth,omitempty"`
-	Username                 string        `yaml:"username,omitempty"`
-	Password                 string        `yaml:"password,omitempty"`
-	Timeout                  time.Duration `yaml:"timeout,omitempty"`
-	ConnectTimeout           time.Duration `yaml:"connect_timeout,omitempty"`
-	Retries                  int           `yaml:"max_retries"`
-	MaxBackoff               time.Duration `yaml:"retry_max_backoff"`
-	MinBackoff               time.Duration `yaml:"retry_min_backoff"`
+	Addresses                string              `yaml:"addresses"`
+	Port                     int                 `yaml:"port"`
+	Keyspace                 string              `yaml:"keyspace"`
+	Consistency              string              `yaml:"consistency"`
+	ReplicationFactor        int                 `yaml:"replication_factor"`
+	DisableInitialHostLookup bool                `yaml:"disable_initial_host_lookup"`
+	SSL                      bool                `yaml:"SSL"`
+	HostVerification         bool                `yaml:"host_verification"`
+	CAPath                   string              `yaml:"CA_path"`
+	Auth                     bool                `yaml:"auth"`
+	Username                 string              `yaml:"username"`
+	Password                 flagext.Secret      `yaml:"password"`
+	PasswordFile             string              `yaml:"password_file"`
+	CustomAuthenticators     flagext.StringSlice `yaml:"custom_authenticators"`
+	Timeout                  time.Duration       `yaml:"timeout"`
+	ConnectTimeout           time.Duration       `yaml:"connect_timeout"`
+	Retries                  int                 `yaml:"max_retries"`
+	MaxBackoff               time.Duration       `yaml:"retry_max_backoff"`
+	MinBackoff               time.Duration       `yaml:"retry_min_backoff"`
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -48,7 +55,9 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.CAPath, "cassandra.ca-path", "", "Path to certificate file to verify the peer.")
 	f.BoolVar(&cfg.Auth, "cassandra.auth", false, "Enable password authentication when connecting to cassandra.")
 	f.StringVar(&cfg.Username, "cassandra.username", "", "Username to use when connecting to cassandra.")
-	f.StringVar(&cfg.Password, "cassandra.password", "", "Password to use when connecting to cassandra.")
+	f.Var(&cfg.Password, "cassandra.password", "Password to use when connecting to cassandra.")
+	f.StringVar(&cfg.PasswordFile, "cassandra.password-file", "", "File containing password to use when connecting to cassandra.")
+	f.Var(&cfg.CustomAuthenticators, "cassandra.custom-authenticator", "If set, when authenticating with cassandra a custom authenticator will be expected during the handshake. This flag can be set multiple times.")
 	f.DurationVar(&cfg.Timeout, "cassandra.timeout", 2*time.Second, "Timeout when connecting to cassandra.")
 	f.DurationVar(&cfg.ConnectTimeout, "cassandra.connect-timeout", 5*time.Second, "Initial connection timeout, used during initial dial to server.")
 	f.IntVar(&cfg.Retries, "cassandra.max-retries", 0, "Number of retries to perform on a request. (Default is 0: no retries)")
@@ -56,13 +65,19 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.DurationVar(&cfg.MaxBackoff, "cassandra.retry-max-backoff", 10*time.Second, "Maximum time to wait before retrying a failed request. (Default = 10s)")
 }
 
+func (cfg *Config) Validate() error {
+	if cfg.Password.Value != "" && cfg.PasswordFile != "" {
+		return errors.Errorf("The password and password_file config options are mutually exclusive.")
+	}
+	if cfg.SSL && cfg.HostVerification && len(strings.Split(cfg.Addresses, ",")) != 1 {
+		return errors.Errorf("Host verification is only possible for a single host.")
+	}
+	return nil
+}
+
 func (cfg *Config) session() (*gocql.Session, error) {
 	consistency, err := gocql.ParseConsistencyWrapper(cfg.Consistency)
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-
-	if err := cfg.createKeyspace(); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -81,27 +96,70 @@ func (cfg *Config) session() (*gocql.Session, error) {
 			Max:        cfg.MaxBackoff,
 		}
 	}
-	cfg.setClusterConfig(cluster)
+	if err = cfg.setClusterConfig(cluster); err != nil {
+		return nil, errors.WithStack(err)
+	}
 
-	return cluster.CreateSession()
+	session, err := cluster.CreateSession()
+	if err == nil {
+		return session, nil
+	}
+	// ErrNoConnectionsStarted will be returned if keyspace don't exist or is invalid.
+	// ref. https://github.com/gocql/gocql/blob/07ace3bab0f84bb88477bab5d79ba1f7e1da0169/cassandra_test.go#L85-L97
+	if err != gocql.ErrNoConnectionsStarted {
+		return nil, errors.WithStack(err)
+	}
+	// keyspace not exist
+	if err := cfg.createKeyspace(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	session, err = cluster.CreateSession()
+	return session, errors.WithStack(err)
 }
 
 // apply config settings to a cassandra ClusterConfig
-func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) {
+func (cfg *Config) setClusterConfig(cluster *gocql.ClusterConfig) error {
 	cluster.DisableInitialHostLookup = cfg.DisableInitialHostLookup
 
 	if cfg.SSL {
-		cluster.SslOpts = &gocql.SslOptions{
-			CaPath:                 cfg.CAPath,
-			EnableHostVerification: cfg.HostVerification,
+		if cfg.HostVerification {
+			cluster.SslOpts = &gocql.SslOptions{
+				CaPath:                 cfg.CAPath,
+				EnableHostVerification: true,
+				Config: &tls.Config{
+					ServerName: strings.Split(cfg.Addresses, ",")[0],
+				},
+			}
+		} else {
+			cluster.SslOpts = &gocql.SslOptions{
+				EnableHostVerification: false,
+			}
 		}
 	}
 	if cfg.Auth {
+		password := cfg.Password.Value
+		if cfg.PasswordFile != "" {
+			passwordBytes, err := ioutil.ReadFile(cfg.PasswordFile)
+			if err != nil {
+				return errors.Errorf("Could not read Cassandra password file: %v", err)
+			}
+			passwordBytes = bytes.TrimRight(passwordBytes, "\n")
+			password = string(passwordBytes)
+		}
+		if len(cfg.CustomAuthenticators) != 0 {
+			cluster.Authenticator = CustomPasswordAuthenticator{
+				ApprovedAuthenticators: cfg.CustomAuthenticators,
+				Username:               cfg.Username,
+				Password:               password,
+			}
+			return nil
+		}
 		cluster.Authenticator = gocql.PasswordAuthenticator{
 			Username: cfg.Username,
-			Password: cfg.Password,
+			Password: password,
 		}
 	}
+	return nil
 }
 
 // createKeyspace will create the desired keyspace if it doesn't exist.
@@ -112,7 +170,9 @@ func (cfg *Config) createKeyspace() error {
 	cluster.Timeout = 20 * time.Second
 	cluster.ConnectTimeout = 20 * time.Second
 
-	cfg.setClusterConfig(cluster)
+	if err := cfg.setClusterConfig(cluster); err != nil {
+		return errors.WithStack(err)
+	}
 
 	session, err := cluster.CreateSession()
 	if err != nil {
@@ -139,6 +199,8 @@ type StorageClient struct {
 
 // NewStorageClient returns a new StorageClient.
 func NewStorageClient(cfg Config, schemaCfg chunk.SchemaConfig) (*StorageClient, error) {
+	pkgutil.WarnExperimentalUse("Cassandra Backend")
+
 	session, err := cfg.session()
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -161,6 +223,7 @@ func (s *StorageClient) Stop() {
 // atomic writes.  Therefore we just do a bunch of writes in parallel.
 type writeBatch struct {
 	entries []chunk.IndexEntry
+	deletes []chunk.IndexEntry
 }
 
 // NewWriteBatch implement chunk.IndexClient.
@@ -177,6 +240,14 @@ func (b *writeBatch) Add(tableName, hashValue string, rangeValue []byte, value [
 	})
 }
 
+func (b *writeBatch) Delete(tableName, hashValue string, rangeValue []byte) {
+	b.deletes = append(b.deletes, chunk.IndexEntry{
+		TableName:  tableName,
+		HashValue:  hashValue,
+		RangeValue: rangeValue,
+	})
+}
+
 // BatchWrite implement chunk.IndexClient.
 func (s *StorageClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch) error {
 	b := batch.(*writeBatch)
@@ -184,6 +255,14 @@ func (s *StorageClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch) 
 	for _, entry := range b.entries {
 		err := s.session.Query(fmt.Sprintf("INSERT INTO %s (hash, range, value) VALUES (?, ?, ?)",
 			entry.TableName), entry.HashValue, entry.RangeValue, entry.Value).WithContext(ctx).Exec()
+		if err != nil {
+			return errors.WithStack(err)
+		}
+	}
+
+	for _, entry := range b.deletes {
+		err := s.session.Query(fmt.Sprintf("DELETE FROM %s WHERE hash = ? and range = ?",
+			entry.TableName), entry.HashValue, entry.RangeValue).WithContext(ctx).Exec()
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -197,7 +276,7 @@ func (s *StorageClient) QueryPages(ctx context.Context, queries []chunk.IndexQue
 	return util.DoParallelQueries(ctx, s.query, queries, callback)
 }
 
-func (s *StorageClient) query(ctx context.Context, query chunk.IndexQuery, callback func(result chunk.ReadBatch) (shouldContinue bool)) error {
+func (s *StorageClient) query(ctx context.Context, query chunk.IndexQuery, callback util.Callback) error {
 	var q *gocql.Query
 
 	switch {
@@ -234,7 +313,7 @@ func (s *StorageClient) query(ctx context.Context, query chunk.IndexQuery, callb
 		if err := scanner.Scan(&b.rangeValue, &b.value); err != nil {
 			return errors.WithStack(err)
 		}
-		if !callback(b) {
+		if !callback(query, b) {
 			return nil
 		}
 	}
@@ -243,7 +322,6 @@ func (s *StorageClient) query(ctx context.Context, query chunk.IndexQuery, callb
 
 // readBatch represents a batch of rows read from Cassandra.
 type readBatch struct {
-	consumed   bool
 	rangeValue []byte
 	value      []byte
 }
@@ -317,4 +395,9 @@ func (s *StorageClient) getChunk(ctx context.Context, decodeContext *chunk.Decod
 	}
 	err = input.Decode(decodeContext, buf)
 	return input, err
+}
+
+func (s *StorageClient) DeleteChunk(ctx context.Context, chunkID string) error {
+	// ToDo: implement this to support deleting chunks from Cassandra
+	return chunk.ErrMethodNotImplemented
 }

@@ -2,6 +2,7 @@
   _config+: {
     namespace: error 'must define namespace',
     cluster: error 'must define cluster',
+    http_listen_port: 80,
 
     replication_factor: 3,
     memcached_replicas: 3,
@@ -47,10 +48,10 @@
 
     client_configs: {
       dynamo: {
-        dynamodbconfig: {} + if $._config.dynamodb_access_key != '' then {
-          dynamodb: 'dynamodb://' + $._config.dynamodb_access_key + ':' + $._config.dynamodb_secret_access_key + '@' + $._config.dynamodb_region,
+        dynamodb: {} + if $._config.dynamodb_access_key != '' then {
+          dynamodb_url: 'dynamodb://' + $._config.dynamodb_access_key + ':' + $._config.dynamodb_secret_access_key + '@' + $._config.dynamodb_region,
         } else {
-          dynamodb: 'dynamodb://' + $._config.dynamodb_region,
+          dynamodb_url: 'dynamodb://' + $._config.dynamodb_region,
         },
       },
       s3: {
@@ -91,10 +92,6 @@
       'limits.per-user-override-config': '/etc/loki/overrides/overrides.yaml',
     },
 
-    // Global limits are currently opt-in only.
-    max_streams_global_limit_enabled: false,
-    ingestion_rate_global_limit_enabled: false,
-
     loki: {
       server: {
         graceful_shutdown_timeout: '5s',
@@ -103,13 +100,15 @@
         grpc_server_max_send_msg_size: $._config.grpc_server_max_msg_size,
         grpc_server_max_concurrent_streams: 1000,
         http_server_write_timeout: '1m',
+        http_listen_port: $._config.http_listen_port,
       },
       frontend: {
         compress_responses: true,
         max_outstanding_per_tenant: 200,
+        log_queries_longer_than: '5s',
       },
       frontend_worker: {
-        address: 'query-frontend.%s.svc.cluster.local:9095' % $._config.namespace,
+        frontend_address: 'query-frontend.%s.svc.cluster.local:9095' % $._config.namespace,
         // Limit to N/2 worker threads per frontend, as we have two frontends.
         parallelism: $._config.querierConcurrency / 2,
         grpc_client_config: {
@@ -141,10 +140,8 @@
         reject_old_samples: true,
         reject_old_samples_max_age: '168h',
         max_query_length: '12000h',  // 500 days
-      } + if !$._config.max_streams_global_limit_enabled then {} else {
-        max_streams_per_user: 0,
+        max_streams_per_user: 0,  // Disabled in favor of the global limit
         max_global_streams_per_user: 10000,  // 10k
-      } + if !$._config.ingestion_rate_global_limit_enabled then {} else {
         ingestion_rate_strategy: 'global',
         ingestion_rate_mb: 10,
         ingestion_burst_size_mb: 20,
@@ -163,8 +160,8 @@
               store: 'consul',
               consul: {
                 host: 'consul.%s.svc.cluster.local:8500' % $._config.namespace,
-                httpclienttimeout: '20s',
-                consistentreads: true,
+                http_client_timeout: '20s',
+                consistent_reads: true,
               },
             },
           },
@@ -172,7 +169,6 @@
           num_tokens: 512,
           heartbeat_period: '5s',
           join_after: '30s',
-          claim_on_rollout: true,
           interface_names: ['eth0'],
         },
       },
@@ -260,21 +256,10 @@
       table_manager: {
         retention_period: 0,
         retention_deletes_enabled: false,
-        index_tables_provisioning: {
-          inactive_read_throughput: 0,
-          inactive_write_throughput: 0,
-          provisioned_read_throughput: 0,
-          provisioned_write_throughput: 0,
-        },
-        chunk_tables_provisioning: {
-          inactive_read_throughput: 0,
-          inactive_write_throughput: 0,
-          provisioned_read_throughput: 0,
-          provisioned_write_throughput: 0,
-        },
+        poll_interval: '10m',
+        creation_grace_period: '3h',
       },
 
-    } + if !$._config.ingestion_rate_global_limit_enabled then {} else {
       distributor: {
         // Creates a ring between distributors, required by the ingestion rate global limit.
         ring: {
@@ -282,10 +267,10 @@
             store: 'consul',
             consul: {
               host: 'consul.%s.svc.cluster.local:8500' % $._config.namespace,
-              httpclienttimeout: '20s',
-              consistentreads: false,
-              watchkeyratelimit: 1,
-              watchkeyburstsize: 1,
+              http_client_timeout: '20s',
+              consistent_reads: false,
+              watch_rate_limit: 1,
+              watch_burst_size: 1,
             },
           },
         },

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"os"
 	"path"
 	"sync"
@@ -127,7 +128,8 @@ func (b *BoltIndexClient) Stop() {
 
 func (b *BoltIndexClient) NewWriteBatch() chunk.WriteBatch {
 	return &boltWriteBatch{
-		tables: map[string]map[string][]byte{},
+		puts:    map[string]map[string][]byte{},
+		deletes: map[string]map[string]struct{}{},
 	}
 }
 
@@ -170,7 +172,8 @@ func (b *BoltIndexClient) GetDB(name string, operation int) (*bbolt.DB, error) {
 }
 
 func (b *BoltIndexClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch) error {
-	for table, kvps := range batch.(*boltWriteBatch).tables {
+	// ToDo: too much code duplication, refactor this
+	for table, kvps := range batch.(*boltWriteBatch).puts {
 		db, err := b.GetDB(table, DBOperationWrite)
 		if err != nil {
 			return err
@@ -193,6 +196,31 @@ func (b *BoltIndexClient) BatchWrite(ctx context.Context, batch chunk.WriteBatch
 			return err
 		}
 	}
+
+	for table, kvps := range batch.(*boltWriteBatch).deletes {
+		db, err := b.GetDB(table, DBOperationWrite)
+		if err != nil {
+			return err
+		}
+
+		if err := db.Update(func(tx *bbolt.Tx) error {
+			b := tx.Bucket(bucketName)
+			if b == nil {
+				return fmt.Errorf("Bucket %s not found in table %s", bucketName, table)
+			}
+
+			for key := range kvps {
+				if err := b.Delete([]byte(key)); err != nil {
+					return err
+				}
+			}
+
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -200,7 +228,7 @@ func (b *BoltIndexClient) QueryPages(ctx context.Context, queries []chunk.IndexQ
 	return chunk_util.DoParallelQueries(ctx, b.query, queries, callback)
 }
 
-func (b *BoltIndexClient) query(ctx context.Context, query chunk.IndexQuery, callback func(chunk.ReadBatch) (shouldContinue bool)) error {
+func (b *BoltIndexClient) query(ctx context.Context, query chunk.IndexQuery, callback chunk_util.Callback) error {
 	db, err := b.GetDB(query.TableName, DBOperationRead)
 	if err != nil {
 		if err == ErrUnexistentBoltDB {
@@ -213,7 +241,7 @@ func (b *BoltIndexClient) query(ctx context.Context, query chunk.IndexQuery, cal
 	return b.QueryDB(ctx, db, query, callback)
 }
 
-func (b *BoltIndexClient) QueryDB(ctx context.Context, db *bbolt.DB, query chunk.IndexQuery, callback func(chunk.ReadBatch) (shouldContinue bool)) error {
+func (b *BoltIndexClient) QueryDB(ctx context.Context, db *bbolt.DB, query chunk.IndexQuery, callback func(chunk.IndexQuery, chunk.ReadBatch) (shouldContinue bool)) error {
 	var start []byte
 	if len(query.RangeValuePrefix) > 0 {
 		start = []byte(query.HashValue + separator + string(query.RangeValuePrefix))
@@ -248,7 +276,7 @@ func (b *BoltIndexClient) QueryDB(ctx context.Context, db *bbolt.DB, query chunk
 
 			batch.rangeValue = k[len(rowPrefix):]
 			batch.value = v
-			if !callback(&batch) {
+			if !callback(query, &batch) {
 				break
 			}
 		}
@@ -258,14 +286,26 @@ func (b *BoltIndexClient) QueryDB(ctx context.Context, db *bbolt.DB, query chunk
 }
 
 type boltWriteBatch struct {
-	tables map[string]map[string][]byte
+	puts    map[string]map[string][]byte
+	deletes map[string]map[string]struct{}
+}
+
+func (b *boltWriteBatch) Delete(tableName, hashValue string, rangeValue []byte) {
+	table, ok := b.deletes[tableName]
+	if !ok {
+		table = map[string]struct{}{}
+		b.deletes[tableName] = table
+	}
+
+	key := hashValue + separator + string(rangeValue)
+	table[key] = struct{}{}
 }
 
 func (b *boltWriteBatch) Add(tableName, hashValue string, rangeValue []byte, value []byte) {
-	table, ok := b.tables[tableName]
+	table, ok := b.puts[tableName]
 	if !ok {
 		table = map[string][]byte{}
-		b.tables[tableName] = table
+		b.puts[tableName] = table
 	}
 
 	key := hashValue + separator + string(rangeValue)

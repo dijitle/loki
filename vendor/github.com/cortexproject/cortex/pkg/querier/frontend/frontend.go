@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,30 +24,26 @@ import (
 	"github.com/weaveworks/common/httpgrpc"
 	"github.com/weaveworks/common/httpgrpc/server"
 	"github.com/weaveworks/common/user"
+
+	"github.com/cortexproject/cortex/pkg/util"
+)
+
+const (
+	// StatusClientClosedRequest is the status code for when a client request cancellation of an http request
+	StatusClientClosedRequest = 499
 )
 
 var (
-	queueDuration = promauto.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "cortex",
-		Name:      "query_frontend_queue_duration_seconds",
-		Help:      "Time spend by requests queued.",
-		Buckets:   prometheus.DefBuckets,
-	})
-	queueLength = promauto.NewGauge(prometheus.GaugeOpts{
-		Namespace: "cortex",
-		Name:      "query_frontend_queue_length",
-		Help:      "Number of queries in the queue.",
-	})
-
-	errTooManyRequest = httpgrpc.Errorf(http.StatusTooManyRequests, "too many outstanding requests")
-	errCanceled       = httpgrpc.Errorf(http.StatusInternalServerError, "context cancelled")
+	errTooManyRequest   = httpgrpc.Errorf(http.StatusTooManyRequests, "too many outstanding requests")
+	errCanceled         = httpgrpc.Errorf(StatusClientClosedRequest, context.Canceled.Error())
+	errDeadlineExceeded = httpgrpc.Errorf(http.StatusGatewayTimeout, context.DeadlineExceeded.Error())
 )
 
 // Config for a Frontend.
 type Config struct {
 	MaxOutstandingPerTenant int           `yaml:"max_outstanding_per_tenant"`
 	CompressResponses       bool          `yaml:"compress_responses"`
-	DownstreamURL           string        `yaml:"downstream"`
+	DownstreamURL           string        `yaml:"downstream_url"`
 	LogQueriesLongerThan    time.Duration `yaml:"log_queries_longer_than"`
 }
 
@@ -68,6 +65,10 @@ type Frontend struct {
 	mtx    sync.Mutex
 	cond   *sync.Cond
 	queues map[string]chan *request
+
+	// Metrics.
+	queueDuration prometheus.Histogram
+	queueLength   prometheus.Gauge
 }
 
 type request struct {
@@ -81,11 +82,22 @@ type request struct {
 }
 
 // New creates a new frontend.
-func New(cfg Config, log log.Logger) (*Frontend, error) {
+func New(cfg Config, log log.Logger, registerer prometheus.Registerer) (*Frontend, error) {
 	f := &Frontend{
 		cfg:    cfg,
 		log:    log,
 		queues: map[string]chan *request{},
+		queueDuration: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
+			Namespace: "cortex",
+			Name:      "query_frontend_queue_duration_seconds",
+			Help:      "Time spend by requests queued.",
+			Buckets:   prometheus.DefBuckets,
+		}),
+		queueLength: promauto.With(registerer).NewGauge(prometheus.GaugeOpts{
+			Namespace: "cortex",
+			Name:      "query_frontend_queue_length",
+			Help:      "Number of queries in the queue.",
+		}),
 	}
 	f.cond = sync.NewCond(&f.mtx)
 
@@ -99,6 +111,11 @@ func New(cfg Config, log log.Logger) (*Frontend, error) {
 		}
 
 		f.roundTripper = RoundTripFunc(func(r *http.Request) (*http.Response, error) {
+			tracer, span := opentracing.GlobalTracer(), opentracing.SpanFromContext(r.Context())
+			if tracer != nil && span != nil {
+				carrier := opentracing.HTTPHeadersCarrier(r.Header)
+				tracer.Inject(span.Context(), opentracing.HTTPHeaders, carrier)
+			}
 			r.URL.Scheme = u.Scheme
 			r.URL.Host = u.Host
 			r.URL.Path = path.Join(u.Path, r.URL.Path)
@@ -143,22 +160,30 @@ func (f *Frontend) Handler() http.Handler {
 }
 
 func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
-	userID, err := user.ExtractOrgID(r.Context())
-	if err != nil {
-		server.WriteError(w, err)
-		return
-	}
 
 	startTime := time.Now()
 	resp, err := f.roundTripper.RoundTrip(r)
-	queryResponseTime := time.Now().Sub(startTime)
+	queryResponseTime := time.Since(startTime)
 
 	if f.cfg.LogQueriesLongerThan > 0 && queryResponseTime > f.cfg.LogQueriesLongerThan {
-		level.Info(f.log).Log("msg", "slow query", "org_id", userID, "url", fmt.Sprintf("http://%s", r.Host+r.RequestURI), "time_taken", queryResponseTime.String())
+		logMessage := []interface{}{
+			"msg", "slow query",
+			"host", r.Host,
+			"path", r.URL.Path,
+			"time_taken", queryResponseTime.String(),
+		}
+		for k, v := range r.URL.Query() {
+			logMessage = append(logMessage, fmt.Sprintf("qs_%s", k), strings.Join(v, ","))
+		}
+		pf := r.PostForm.Encode()
+		if pf != "" {
+			logMessage = append(logMessage, "body", pf)
+		}
+		level.Info(util.WithContext(r.Context(), f.log)).Log(logMessage...)
 	}
 
 	if err != nil {
-		server.WriteError(w, err)
+		writeError(w, err)
 		return
 	}
 
@@ -167,7 +192,22 @@ func (f *Frontend) handle(w http.ResponseWriter, r *http.Request) {
 		hs[h] = vs
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+
+	if _, err = io.Copy(w, resp.Body); err != nil {
+		server.WriteError(w, err)
+		return
+	}
+}
+
+func writeError(w http.ResponseWriter, err error) {
+	switch err {
+	case context.Canceled:
+		err = errCanceled
+	case context.DeadlineExceeded:
+		err = errDeadlineExceeded
+	default:
+	}
+	server.WriteError(w, err)
 }
 
 // RoundTrip implement http.Transport.
@@ -230,7 +270,7 @@ func (f *Frontend) RoundTripGRPC(ctx context.Context, req *ProcessRequest) (*Pro
 
 	select {
 	case <-ctx.Done():
-		return nil, errCanceled
+		return nil, ctx.Err()
 
 	case resp := <-request.response:
 		return resp, nil
@@ -316,7 +356,7 @@ func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
 
 	select {
 	case queue <- req:
-		queueLength.Add(1)
+		f.queueLength.Add(1)
 		f.cond.Broadcast()
 		return nil
 	default:
@@ -324,12 +364,13 @@ func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
 	}
 }
 
-// getQueue picks a random queue and takes the next request off of it, so we
+// getQueue picks a random queue and takes the next unexpired request off of it, so we
 // fairly process users queries.  Will block if there are no requests.
 func (f *Frontend) getNextRequest(ctx context.Context) (*request, error) {
 	f.mtx.Lock()
 	defer f.mtx.Unlock()
 
+FindQueue:
 	for len(f.queues) == 0 && ctx.Err() == nil {
 		f.cond.Wait()
 	}
@@ -338,27 +379,58 @@ func (f *Frontend) getNextRequest(ctx context.Context) (*request, error) {
 		return nil, err
 	}
 
-	i, n := 0, rand.Intn(len(f.queues))
-	for userID, queue := range f.queues {
-		if i < n {
-			i++
+	keys := make([]string, 0, len(f.queues))
+	for k := range f.queues {
+		keys = append(keys, k)
+	}
+	rand.Shuffle(len(keys), func(i, j int) { keys[i], keys[j] = keys[j], keys[i] })
+
+	for _, userID := range keys {
+		queue, ok := f.queues[userID]
+		if !ok {
 			continue
 		}
+		/*
+		  We want to dequeue the next unexpired request from the chosen tenant queue.
+		  The chance of choosing a particular tenant for dequeueing is (1/active_tenants).
+		  This is problematic under load, especially with other middleware enabled such as
+		  querier.split-by-interval, where one request may fan out into many.
+		  If expired requests aren't exhausted before checking another tenant, it would take
+		  n_active_tenants * n_expired_requests_at_front_of_queue requests being processed
+		  before an active request was handled for the tenant in question.
+		  If this tenant meanwhile continued to queue requests,
+		  it's possible that it's own queue would perpetually contain only expired requests.
+		*/
 
-		request := <-queue
-		if len(queue) == 0 {
-			delete(f.queues, userID)
+		// Pick the first non-expired request from this user's queue (if any).
+		for {
+			lastRequest := false
+			request := <-queue
+			if len(queue) == 0 {
+				delete(f.queues, userID)
+				lastRequest = true
+			}
+
+			// Tell close() we've processed a request.
+			f.cond.Broadcast()
+
+			f.queueDuration.Observe(time.Since(request.enqueueTime).Seconds())
+			f.queueLength.Add(-1)
+			request.queueSpan.Finish()
+
+			// Ensure the request has not already expired.
+			if request.originalCtx.Err() == nil {
+				return request, nil
+			}
+
+			// Stop iterating on this queue if we've just consumed the last request.
+			if lastRequest {
+				break
+			}
 		}
-
-		// Tell close() we've processed a request.
-		f.cond.Broadcast()
-
-		queueDuration.Observe(time.Now().Sub(request.enqueueTime).Seconds())
-		queueLength.Add(-1)
-		request.queueSpan.Finish()
-
-		return request, nil
 	}
 
-	panic("should never happen")
+	// There are no unexpired requests, so we can get back
+	// and wait for more requests.
+	goto FindQueue
 }

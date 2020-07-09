@@ -35,6 +35,16 @@ type metrics struct {
 	c Client
 }
 
+func (m metrics) List(ctx context.Context, prefix string) ([]string, error) {
+	var result []string
+	err := instrument.CollectedRequest(ctx, "List", requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+		var err error
+		result, err = m.c.List(ctx, prefix)
+		return err
+	})
+	return result, err
+}
+
 func (m metrics) Get(ctx context.Context, key string) (interface{}, error) {
 	var result interface{}
 	err := instrument.CollectedRequest(ctx, "GET", requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
@@ -45,6 +55,13 @@ func (m metrics) Get(ctx context.Context, key string) (interface{}, error) {
 	return result, err
 }
 
+func (m metrics) Delete(ctx context.Context, key string) error {
+	err := instrument.CollectedRequest(ctx, "Delete", requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+		return m.c.Delete(ctx, key)
+	})
+	return err
+}
+
 func (m metrics) CAS(ctx context.Context, key string, f func(in interface{}) (out interface{}, retry bool, err error)) error {
 	return instrument.CollectedRequest(ctx, "CAS", requestDuration, errorCode, func(ctx context.Context) error {
 		return m.c.CAS(ctx, key, f)
@@ -52,19 +69,15 @@ func (m metrics) CAS(ctx context.Context, key string, f func(in interface{}) (ou
 }
 
 func (m metrics) WatchKey(ctx context.Context, key string, f func(interface{}) bool) {
-	instrument.CollectedRequest(ctx, "WatchKey", requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+	_ = instrument.CollectedRequest(ctx, "WatchKey", requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		m.c.WatchKey(ctx, key, f)
 		return nil
 	})
 }
 
 func (m metrics) WatchPrefix(ctx context.Context, prefix string, f func(string, interface{}) bool) {
-	instrument.CollectedRequest(ctx, "WatchPrefix", requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
+	_ = instrument.CollectedRequest(ctx, "WatchPrefix", requestDuration, instrument.ErrorCode, func(ctx context.Context) error {
 		m.c.WatchPrefix(ctx, prefix, f)
 		return nil
 	})
-}
-
-func (m metrics) Stop() {
-	m.c.Stop()
 }

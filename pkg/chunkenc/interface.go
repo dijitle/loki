@@ -18,7 +18,7 @@ var (
 	ErrOutOfOrder      = errors.New("entry out of order")
 	ErrInvalidSize     = errors.New("invalid size")
 	ErrInvalidFlag     = errors.New("invalid flag")
-	ErrInvalidChecksum = errors.New("invalid checksum")
+	ErrInvalidChecksum = errors.New("invalid chunk checksum")
 )
 
 // Encoding is the identifier for a chunk encoding.
@@ -40,6 +40,7 @@ const (
 )
 
 var supportedEncoding = []Encoding{
+	EncNone,
 	EncGZIP,
 	EncLZ4_64k,
 	EncSnappy,
@@ -96,7 +97,7 @@ type Chunk interface {
 	Bounds() (time.Time, time.Time)
 	SpaceFor(*logproto.Entry) bool
 	Append(*logproto.Entry) error
-	Iterator(ctx context.Context, from, through time.Time, direction logproto.Direction, filter logql.Filter) (iter.EntryIterator, error)
+	Iterator(ctx context.Context, from, through time.Time, direction logproto.Direction, filter logql.LineFilter) (iter.EntryIterator, error)
 	Size() int
 	Bytes() ([]byte, error)
 	Blocks() int
