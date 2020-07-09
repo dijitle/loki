@@ -24,9 +24,9 @@ steps:
       - name: dockersock
         path: /var/run/
     commands:
-      - docker tag dijitle/fluent-bit-plugin-loki:$DRONE_COMMIT dijitle/fluent-bit-plugin-loki:1.3
+      - docker tag dijitle/fluent-bit-plugin-loki:$DRONE_COMMIT dijitle/fluent-bit-plugin-loki:1.5.0
       - docker login -u $USERNAME -p $PASSWORD
-      - docker push dijitle/fluent-bit-plugin-loki:1.3
+      - docker push dijitle/fluent-bit-plugin-loki:1.5.0
 
 volumes:
   - name: dockersock
@@ -34,6 +34,6 @@ volumes:
       path: /var/run/
 ---
 kind: signature
-hmac: 7b8b9d44d423e83a033e62f1c29212b9832d951fe2a9c8ba0a84e786e449c739
+hmac: a0abd51d09cdec4c1de8ce78d210ec4f806d1b05abcb037879ba756c4a03b0d9
 
 ...
